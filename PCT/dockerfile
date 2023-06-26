@@ -1,0 +1,23 @@
+FROM nvidia/cuda:11.1.1-base-ubuntu20.04
+
+# Specify the maintainer (optional)
+LABEL maintainer="YourName <YourEmail@domain.com>"
+
+# Update the Ubuntu package list
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    vim \
+    ca-certificates \
+    libjpeg-dev \
+    libpng-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Setup the working directory
+WORKDIR /workspace
+RUN chmod -R a+w /workspace
+
+# Command to run when the container starts
+CMD ["/bin/bash"]

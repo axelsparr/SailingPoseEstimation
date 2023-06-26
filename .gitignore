@@ -1,0 +1,9 @@
+*.pth
+*.mp4
+*.jpg
+*.mov
+*.MOV
+/PCT/videos/
+/PCT/demo/
+VideoX/
+pytracking/
