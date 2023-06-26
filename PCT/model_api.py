@@ -7,7 +7,7 @@ import warnings
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-plt.switch_backend('agg')
+#plt.switch_backend('agg')
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 import torch 
@@ -28,6 +28,17 @@ import matplotlib.patches as patches
 from enum import Enum
 from pathlib import Path
 import contextlib
+
+import mmtrack
+import mmdet
+from mmtrack.apis import inference_sot,inference_mot, init_model
+import tempfile
+import mmcv
+import tempfile
+import cv2
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
 
 class ColorStyle:
     """
@@ -94,6 +105,9 @@ class PoseExtraction:
         same as the one i (Axel) verified to work
         """
         assert mmcv.__version__ == "1.7.0"
+        assert mmdet.__version__ == "2.26.0"
+        assert mmtrack.__version__ == "0.14.0"
+        #assert mmengine.__version == "0.7.4"
         assert torch.version.cuda == "11.1"
         assert torch.__version__ == "1.8.0+cu111"
         assert sys.version_info.major ==3
@@ -106,7 +120,7 @@ class PoseExtraction:
         #convert the output frames to a video and save it
         images_to_video(frames, output_path, framerate)
         print("Wrote visualization video to " + str(output_path))
-        
+
     #sets self.det_model,self.pose_model,self.dataset and self._dataset_info
     def init_models(self,detec_config,detec_checkpoint,pose_config,pose_checkpoint,device):
         self.det_model = init_detector(
@@ -124,7 +138,56 @@ class PoseExtraction:
                 DeprecationWarning)
         else:
             self._dataset_info = DatasetInfo(self._dataset_info)
-    
+    #visualizes the first frame of the video with the bbox on top to check if its a good fit
+    #init_bbox, initial bounding box [x1,y1,x2,y2]
+    #input_video, absolute path to the input video
+    def vis_bbox_first_frame(self,init_bbox,input_video):        
+        # Load the video
+        video = cv2.VideoCapture(input_video)
+        # Get the first frame of the video
+        ret, frame = video.read()
+        # Convert to RGB for matplotlib
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Prepare figure
+        fig,ax = plt.subplots(1)
+        # Display the image
+        ax.imshow(frame)
+        rectangle = Rectangle((init_bbox[0],init_bbox[1]),(init_bbox[2]-init_bbox[0]),(init_bbox[3]-init_bbox[1]),linewidth=1,edgecolor='r',facecolor='none')
+        # Draw the rectangle on the image
+        ax.add_patch(rectangle)
+        video.release()
+        return plt
+    #calculates the bounding box using the SOT model form mmtracking
+    def calculate_sot_bbox(self,init_bbox,input_video):
+        sot_config = Path("mmtracking_configs") / "sot" / "siamese_rpn" / "siamese_rpn_r50_20e_lasot.py"
+        sot_config=str(sot_config.absolute())
+        sot_checkpoint = Path("mmtracking_checkpoints") / "siamese_rpn_r50_1x_lasot_20211203_151612-da4b3c66.pth"
+        sot_checkpoint=str(sot_checkpoint.absolute())
+        # build the model from a config file and a checkpoint file
+        sot_model = init_model(sot_config, sot_checkpoint, device='cuda:0')
+        #xstart ystart xend yend?
+
+        imgs = mmcv.VideoReader(input_video)
+        prog_bar = mmcv.ProgressBar(len(imgs))
+        out_dir = tempfile.TemporaryDirectory()
+        out_path = out_dir.name
+        result_lst = []
+        for i, img in enumerate(imgs):
+            result = inference_sot(sot_model, img, init_bbox, frame_id=i)
+            sot_model.show_result(
+                    img,
+                    result,
+                    wait_time=int(1000. / imgs.fps),
+                    out_file=f'{out_path}/{i:06d}.jpg')
+            prog_bar.update()
+            result_lst.append(result)
+        output = Path("output") / 'sot.mp4'
+        print(f'\n making the output video at {output} with a FPS of {imgs.fps}')
+        mmcv.frames2video(out_path, output, fps=imgs.fps, fourcc='mp4v')
+        out_dir.cleanup()
+    #takes in a video and sets everything except the larger bounding box to 0
+    def apply_bounding_box_mask(self):
+        pass
     #modified version of PCT/vis_tools/demo_img_with_mmdet.py
     #calls the functions multiple time with a single frame
     def video_inference(self,
