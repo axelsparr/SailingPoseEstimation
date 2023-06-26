@@ -3,7 +3,6 @@ from models import PCT
 from argparse import ArgumentParser
 import os
 import warnings
-from argparse import ArgumentParser
 
 import cv2
 import numpy as np
@@ -20,18 +19,11 @@ from mmpose.apis import (inference_top_down_pose_model, process_mmdet_results)
 from mmpose.datasets import DatasetInfo
 from mmdet.apis import inference_detector, init_detector
 from models.builder import build_posenet
-import mmcv
 
 import io
-import cv2
-import numpy as np
 from PIL import Image
 import datetime
 import matplotlib.patches as patches
-import matplotlib.pyplot as plt
-import numpy as np
-import io
-from PIL import Image
 from enum import Enum
 
 class ColorStyle:
