@@ -19,12 +19,15 @@ from mmpose.apis import (inference_top_down_pose_model, process_mmdet_results)
 from mmpose.datasets import DatasetInfo
 from mmdet.apis import inference_detector, init_detector
 from models.builder import build_posenet
+from tqdm import tqdm
 
 import io
 from PIL import Image
 import datetime
 import matplotlib.patches as patches
 from enum import Enum
+from pathlib import Path
+import contextlib
 
 class ColorStyle:
     """
@@ -80,7 +83,7 @@ def map_joint_dict(joints):
 #SKELETON paints the visualization with the joints and bones on every frame
 #BBOX creates red boxes demarkating where the bounding box model detected a box of the specific category, i.e. human
 #NONE, dont visualize the result just get the values
-class VType(Enum):
+class VisType(Enum):
     SKELETON = 1
     BBOX = 2
     NONE = 3
@@ -102,6 +105,7 @@ class PoseExtraction:
         output_path = os.path.join(dir,filename)
         #convert the output frames to a video and save it
         images_to_video(frames, output_path, framerate)
+        print("Wrote visualization video to " + str(output_path))
         
     #sets self.det_model,self.pose_model,self.dataset and self._dataset_info
     def init_models(self,detec_config,detec_checkpoint,pose_config,pose_checkpoint,device):
@@ -125,69 +129,67 @@ class PoseExtraction:
     #calls the functions multiple time with a single frame
     def video_inference(self,
                         video_name,
-                        vis=VType.NONE,
+                        vis_type=VisType.NONE,
                         framerate=1,#how many times a second to run the pose estimation
                         video_folder="videos/",
                         output_dir="output/",
                         thickness=2,
                         bbox_threshold=0.3,
                         ):
-
-        video_path = os.path.join(video_folder, video_name)
-        
-        video_frames = extract_frames(video_path,sample_rate=framerate)
-        
-        output_data = []
-        output_frames = []
-        framecount = 0
-        for frame in video_frames:
-            # test a single image, the resulting box is (x1, y1, x2, y2)
-            mmdet_results = inference_detector(self.det_model, frame)
-            print(mmdet_results)
-            # keep the person class bounding boxes.
-            person_results = process_mmdet_results(mmdet_results, self.cat_id)
-
-            # test a single image, with a list of bboxes.
-
-            # optional
-            return_heatmap = False
-
-            # e.g. use ('backbone', ) to return backbone feature
-            output_layer_names = None
-
-            #can be given a list of images from memory
-            pose_results, returned_outputs = inference_top_down_pose_model(
-                self.pose_model,
-                frame,
-                person_results,
-                bbox_thr=bbox_threshold,
-                format='xyxy',
-                dataset=self.dataset,
-                dataset_info=self._dataset_info,
-                return_heatmap=return_heatmap,
-                outputs=output_layer_names)
+            video_path = os.path.join(video_folder, video_name)
             
-            output_data.append(pose_results)
+            video_frames = extract_frames(video_path,sample_rate=framerate)
             
-            # show the results depending on vis
-            if vis==VType.SKELETON:
-                out_frame = vis_pose_result_np(
+            output_data = []
+            output_frames = []
+            framecount = 0
+            for frame in tqdm(video_frames, desc="Processing frames", unit="frames"):
+                # test a single image, the resulting box is (x1, y1, x2, y2)
+                mmdet_results = inference_detector(self.det_model, frame)
+                # keep the person class bounding boxes.
+                person_results = process_mmdet_results(mmdet_results, self.cat_id)
+
+                # test a single image, with a list of bboxes.
+
+                # optional
+                return_heatmap = False
+
+                # e.g. use ('backbone', ) to return backbone feature
+                output_layer_names = None
+
+                #can be given a list of images from memory
+                pose_results, returned_outputs = inference_top_down_pose_model(
+                    self.pose_model,
                     frame,
-                    pose_results,
+                    person_results,
+                    bbox_thr=bbox_threshold,
+                    format='xyxy',
+                    dataset=self.dataset,
+                    dataset_info=self._dataset_info,
+                    return_heatmap=return_heatmap,
+                    outputs=output_layer_names)
+                
+                output_data.append(pose_results)
+                
+                # show the results depending on vis
+                if vis_type==VisType.SKELETON:
+                    out_frame = vis_pose_result_np(
+                        frame,
+                        pose_results,
+                        thickness=thickness)
+                    output_frames.append(out_frame)
+                elif vis_type==VisType.BBOX:
+                    out_frame = vis_bbox_result_np(
+                    frame,
+                    person_results,
                     thickness=thickness)
-                output_frames.append(out_frame)
-            elif vis==VType.BBOX:
-                out_frame = vis_bbox_result_np(
-                frame,
-                person_results,
-                thickness=thickness)
-                output_frames.append(out_frame)
+                    output_frames.append(out_frame)
 
-            framecount += 1
-        if vis != VType.NONE:
-            self.save_output_video(output_dir,output_frames,framerate)
-        print("Total frames processed: "+str(framecount))
-        return output_data
+                framecount += 1
+            if vis_type != VisType.NONE:
+                self.save_output_video(output_dir,output_frames,framerate)
+            print("Total frames processed: "+str(framecount))
+            #return output_data
     def __init__(self,
                  detec_config="vis_tools/cascade_rcnn_x101_64x4d_fpn_coco.py",
                  detec_checkpoint="https://download.openmmlab.com/mmdetection/v2.0/cascade_rcnn/cascade_rcnn_x101_64x4d_fpn_20e_coco/cascade_rcnn_x101_64x4d_fpn_20e_coco_20200509_224357-051557b1.pth",
@@ -197,9 +199,10 @@ class PoseExtraction:
         #make sure all packages are the right version
         self.check_env()
 
-        pose_config="configs/pct_"+model_size+"_classifier.py"
-        pose_checkpoint="C:\\Users\\A\\Documents\\RISE\\segling\\PCT\\weights\\pct\\swin_"+model_size+".pth"
-    
+        pose_config=Path("configs") / f"pct_{model_size}_classifier.py"
+        pose_config=str(pose_config.absolute())
+        pose_checkpoint=Path("weights") / "pct" / f"swin_{model_size}.pth"
+        pose_checkpoint=str(pose_checkpoint.absolute())
         self.cat_id = 1 #Category id for bounding box detection model, 1 corresponds to person?
         
         #initialize the models
