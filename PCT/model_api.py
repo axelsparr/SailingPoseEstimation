@@ -181,13 +181,29 @@ class PoseExtraction:
                     out_file=f'{out_path}/{i:06d}.jpg')
             prog_bar.update()
             result_lst.append(result)
+        #write the output video file
         output = Path("output") / 'sot.mp4'
         print(f'\n making the output video at {output} with a FPS of {imgs.fps}')
-        mmcv.frames2video(out_path, output, fps=imgs.fps, fourcc='mp4v')
-        out_dir.cleanup()
+        mmcv.frames2video(out_path, str(output.absolute()), fps=imgs.fps, fourcc='mp4v')
+        out_dir.cleanup() #removes the temporary .jpg files
+        #rename the dict keys to match the other model, "bbox" is what PCT expects
+        for elem in result_lst:
+            elem["bbox"] = elem.pop("track_bboxes")
+        return result_lst
+    
     #takes in a video and sets everything except the larger bounding box to 0
-    def apply_bounding_box_mask(self):
-        pass
+    def apply_bounding_box_mask(self,init_bbox,input_video):
+        bboxes = self.calculate_sot_bbox(init_bbox,input_video)
+        imgs = mmcv.VideoReader(input_video)
+        prog_bar = mmcv.ProgressBar(len(imgs))
+        frames_out = []
+        for i,frame in enumerate(imgs): 
+            out = set_pixels_outside_bbox_black(frame,bboxes[i]["bbox"])
+            out = out.astype(np.uint8)
+            out=cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+            frames_out.append(out) #inefficient but easy solution
+            prog_bar.update()
+        self.save_output_video("output",frames_out,30)
     #modified version of PCT/vis_tools/demo_img_with_mmdet.py
     #calls the functions multiple time with a single frame
     def video_inference(self,
@@ -270,7 +286,24 @@ class PoseExtraction:
         
         #initialize the models
         self.init_models(detec_config,detec_checkpoint,pose_config,pose_checkpoint,device)
+#takes in a video frame as an np array and sets all pixels outside the bbox in x1,y1,x2,y2 format to 0,0,0
+def set_pixels_outside_bbox_black(image, rectangle):
+        # Ensure value is an array
+    value = np.array([0,0,0])
+    image= image.astype(np.int32)
+    # Convert rectangle coordinates to integers
+    rectangle = [int(coord) for coord in rectangle]
+        
+    # Create mask with ones
+    mask = np.ones(image.shape, dtype=bool)
+    
+    # Set rectangle area to False
+    mask[rectangle[1]:rectangle[3], rectangle[0]:rectangle[2]] = False
 
+    # Assign the value to the pixels outside the rectangle
+    np.putmask(image, mask, value)
+
+    return image
 ##Below functions are outside of the class since they are not meant to be called directly  
 def init_pose_model(config, checkpoint=None, device='cuda:0'):
     """Initialize a pose model from config file.
