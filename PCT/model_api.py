@@ -192,18 +192,18 @@ class PoseExtraction:
         return result_lst
     
     #takes in a video and sets everything except the larger bounding box to 0
-    def apply_bounding_box_mask(self,init_bbox,input_video):
+    def apply_bounding_box_mask(self,init_bbox,input_video,blur_amount=30):
         bboxes = self.calculate_sot_bbox(init_bbox,input_video)
         imgs = mmcv.VideoReader(input_video)
         prog_bar = mmcv.ProgressBar(len(imgs))
         frames_out = []
         for i,frame in enumerate(imgs): 
-            out = set_pixels_outside_bbox_black(frame,bboxes[i]["bbox"])
+            out = blur_all_pixels_outside_bbox(frame,bboxes[i]["bbox"],blur_amount=blur_amount)
             out = out.astype(np.uint8)
             out=cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
             frames_out.append(out) #inefficient but easy solution
             prog_bar.update()
-        self.save_output_video("output",frames_out,30)
+        self.save_output_video("output",frames_out,imgs.fps)
     #modified version of PCT/vis_tools/demo_img_with_mmdet.py
     #calls the functions multiple time with a single frame
     def video_inference(self,
@@ -286,6 +286,18 @@ class PoseExtraction:
         
         #initialize the models
         self.init_models(detec_config,detec_checkpoint,pose_config,pose_checkpoint,device)
+#
+def blur_all_pixels_outside_bbox(image,bbox,blur_amount=30):
+    bbox = [int(coord) for coord in bbox]
+    x1, y1, x2, y2, prob = bbox
+    blurred_image = image.copy()
+    # Apply a Gaussian blur to the copy of the image
+    blurred_image = cv2.GaussianBlur(blurred_image, (99,99), blur_amount)
+
+    # Paste the non-blurred region back onto the blurred image
+    blurred_image[y1:y2, x1:x2] = image[y1:y2, x1:x2]
+    return blurred_image
+
 #takes in a video frame as an np array and sets all pixels outside the bbox in x1,y1,x2,y2 format to 0,0,0
 def set_pixels_outside_bbox_black(image, rectangle):
         # Ensure value is an array
@@ -447,8 +459,12 @@ def extract_frames(video_path, sample_rate):
 
     # Get the video's default frame rate
     default_fps = video.get(cv2.CAP_PROP_FPS)
+    print(video_path + " has " + str(default_fps) + " fps")
     if default_fps == None or default_fps == 0:
         default_fps = 1
+    #if we specify a too high framerate just use the highest we can
+    if sample_rate > default_fps:
+        sample_rate = default_fps
     frame_count = 0
     frames = []
 
