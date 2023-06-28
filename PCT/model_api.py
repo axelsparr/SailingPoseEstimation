@@ -38,7 +38,7 @@ import tempfile
 import cv2
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-
+import pickle
 
 class ColorStyle:
     """
@@ -198,7 +198,7 @@ class PoseExtraction:
         prog_bar = mmcv.ProgressBar(len(imgs))
         frames_out = []
         for i,frame in enumerate(imgs): 
-            out = blur_all_pixels_outside_bbox(frame,bboxes[i]["bbox"],blur_amount=blur_amount)
+            out = crop_image_bbox(frame,bboxes[i]["bbox"])
             out = out.astype(np.uint8)
             out=cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
             frames_out.append(out) #inefficient but easy solution
@@ -218,7 +218,9 @@ class PoseExtraction:
             video_path = os.path.join(video_folder, video_name)
             
             video_frames = extract_frames(video_path,sample_rate=framerate)
-            
+            bboxes=None
+            with open('data_yolo.pkl', 'rb') as f:
+                bboxes = pickle.load(f)
             output_data = []
             output_frames = []
             framecount = 0
@@ -226,7 +228,7 @@ class PoseExtraction:
                 # test a single image, the resulting box is (x1, y1, x2, y2)
                 mmdet_results = inference_detector(self.det_model, frame)
                 # keep the person class bounding boxes.
-                person_results = process_mmdet_results(mmdet_results, self.cat_id)
+                #person_results = process_mmdet_results(mmdet_results, self.cat_id)
 
                 # test a single image, with a list of bboxes.
 
@@ -240,7 +242,7 @@ class PoseExtraction:
                 pose_results, returned_outputs = inference_top_down_pose_model(
                     self.pose_model,
                     frame,
-                    person_results,
+                    bboxes,
                     bbox_thr=bbox_threshold,
                     format='xyxy',
                     dataset=self.dataset,
@@ -269,6 +271,37 @@ class PoseExtraction:
                 self.save_output_video(output_dir,output_frames,framerate)
             print("Total frames processed: "+str(framecount))
             #return output_data
+    def zoom(self,image, zoom_factor):
+        height, width, _ = image.shape
+
+        # Getting the center of the image
+        center_height = height // 2
+        center_width = width // 2
+
+        # Calculating the new dimensions of the image
+        new_height = int(height // zoom_factor)
+        new_width = int(width // zoom_factor)
+
+        # Getting the region of interest
+        roi = image[center_height - new_height // 2: center_height + new_height // 2,
+                    center_width - new_width // 2: center_width + new_width // 2, :]
+        
+        # Resizing the ROI to the original size to achieve zoom effect using bicubic interpolation
+        zoomed_image = cv2.resize(roi, (width, height), interpolation=cv2.INTER_CUBIC)
+
+        return zoomed_image
+
+    def zoom_video(self,input_video, output_video_path, zoom_factor):
+        imgs = mmcv.VideoReader(input_video)
+        prog_bar = mmcv.ProgressBar(len(imgs))
+        frames_out = []
+        for i,frame in enumerate(imgs): 
+            out = self.zoom(frame,zoom_factor)
+            out = out.astype(np.uint8)
+            out=cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+            frames_out.append(out) #inefficient but easy solution
+            prog_bar.update()
+        self.save_output_video("output",frames_out,imgs.fps)
     def __init__(self,
                  detec_config="vis_tools/cascade_rcnn_x101_64x4d_fpn_coco.py",
                  detec_checkpoint="https://download.openmmlab.com/mmdetection/v2.0/cascade_rcnn/cascade_rcnn_x101_64x4d_fpn_20e_coco/cascade_rcnn_x101_64x4d_fpn_20e_coco_20200509_224357-051557b1.pth",
@@ -286,9 +319,61 @@ class PoseExtraction:
         
         #initialize the models
         self.init_models(detec_config,detec_checkpoint,pose_config,pose_checkpoint,device)
-#
+
+##Below functions are outside of the class since they are not meant to be called directly  
+def calc_max_box_delta_x(bboxes):
+    max_dx = 0
+    for bbox in bboxes:
+        x1, y1, x2, y2,probs = bbox
+        if((x2-x1) > max_dx):
+            max_dx= x2-x1
+    return max_dx
+def calc_max_box_y(bboxes):
+    max_dy = 0
+    for bbox in bboxes:
+        x1, y1, x2, y2,probs = bbox
+        if((y2-y1) > max_dy):
+            max_dy= y2-y1
+    return max_dy
+
+#get just the inside, extracts what is inside the bbox in each frame, then scales it up with bicubic to the specified width height
+#the idea is that width,height come from the largest x_delta and y_delta of all the frames
+#useful since instead of getting a normal size video with smeared pixels it gets a small video with normal "size pixels"
+#although cant tell the difference when you watch it in media player as they get treated the same
+def crop_video(video_path, bounding_boxes, output_dir, width, height):
+    imgs = mmcv.VideoReader(video_path)
+    prog_bar = mmcv.ProgressBar(len(imgs))
+    # Get video properties
+    fps = imgs.fps
+
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+    out = cv2.VideoWriter(f'{output_dir}/output.mp4', fourcc, fps, (int(width), int(height)))
+    for i,frame in enumerate(imgs): 
+        x1, y1, x2, y2, prob = bounding_boxes[i]
+        # Extract the region inside the bounding box
+        region = frame[y1:y2, x1:x2]
+        rescaled = cv2.resize(region, (width, height), interpolation=cv2.INTER_CUBIC)
+        out.write(rescaled)
+        prog_bar.update()
+#offset is a "padding" in all directions
+def crop_image_bbox(image,bbox,offset=0):
+    bbox = bbox.astype(np.int32)
+    #bbox = [int(coord) for coord in bbox]
+    x1, y1, x2, y2, prob = bbox+offset
+
+    # Extract the region inside the bounding box
+    region = image[y1:y2, x1:x2]
+    # Get the original image dimensions
+    height, width = image.shape[:2]
+
+    # Rescale the region to fit the original image size
+    rescaled = cv2.resize(region, (width, height), interpolation=cv2.INTER_CUBIC)
+    return rescaled
+#applies gaussian blur to all pixels outside the specified box and returns the image,opencv can handle np arrays directly
 def blur_all_pixels_outside_bbox(image,bbox,blur_amount=30):
-    bbox = [int(coord) for coord in bbox]
+    bbox = bbox.astype(np.int32)
+    #bbox = [int(coord) for coord in bbox]
     x1, y1, x2, y2, prob = bbox
     blurred_image = image.copy()
     # Apply a Gaussian blur to the copy of the image
@@ -316,7 +401,6 @@ def set_pixels_outside_bbox_black(image, rectangle):
     np.putmask(image, mask, value)
 
     return image
-##Below functions are outside of the class since they are not meant to be called directly  
 def init_pose_model(config, checkpoint=None, device='cuda:0'):
     """Initialize a pose model from config file.
 
@@ -521,3 +605,4 @@ def vis_bbox_result_np(data_numpy, bbox_results, thickness):
     img_arr = np.array(Image.open(buf))
     
     return img_arr
+
