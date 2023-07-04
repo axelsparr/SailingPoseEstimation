@@ -3,6 +3,8 @@ from models import PCT
 from argparse import ArgumentParser
 import os
 import warnings
+from ultralytics import YOLO
+import glob
 
 import cv2
 import numpy as np
@@ -28,6 +30,7 @@ import matplotlib.patches as patches
 from enum import Enum
 from pathlib import Path
 import contextlib
+import shutil
 
 import mmtrack
 import mmdet
@@ -56,45 +59,49 @@ class ColorStyle:
         self.ring_color = []
         for i in range(len(self.point_color)):
             self.ring_color.append(tuple(np.array(self.point_color[i])/255.))
-            
-#from PCT library, helps define colors for the visualization of bones        
-color2 = [(252,176,243),(252,176,243),(252,176,243),
-    (0,176,240), (0,176,240), (0,176,240),
-    (255,255,0), (255,255,0),(169, 209, 142),
-    (169, 209, 142),(169, 209, 142),
-    (240,2,127),(240,2,127),(240,2,127), (240,2,127), (240,2,127)]
-link_pairs2 = [
-        [15, 13], [13, 11], [11, 5], 
-        [12, 14], [14, 16], [12, 6], 
-        [9, 7], [7,5], [5, 6], [6, 8], [8, 10],
-        [3, 1],[1, 2],[1, 0],[0, 2],[2,4],
-        ]
-point_color2 = [(240,2,127),(240,2,127),(240,2,127), 
-            (240,2,127), (240,2,127), 
-            (255,255,0),(169, 209, 142),
-            (255,255,0),(169, 209, 142),
-            (255,255,0),(169, 209, 142),
-            (252,176,243),(0,176,240),(252,176,243),
-            (0,176,240),(252,176,243),(0,176,240),
-            (255,255,0),(169, 209, 142),
-            (255,255,0),(169, 209, 142),
-            (255,255,0),(169, 209, 142)]
-chunhua_style = ColorStyle(color2, link_pairs2, point_color2)
-def map_joint_dict(joints):
-    joints_dict = {}
-    for i in range(joints.shape[0]):
-        x = int(joints[i][0])
-        y = int(joints[i][1])
-        id = i
-        joints_dict[id] = (x, y)
-        
-    return joints_dict
+class ChunhuaStyle(ColorStyle):
+    def __init__(self):
+        color2 = [(252,176,243),(252,176,243),(252,176,243),
+        (0,176,240), (0,176,240), (0,176,240),
+        (255,255,0), (255,255,0),(169, 209, 142),
+        (169, 209, 142),(169, 209, 142),
+        (240,2,127),(240,2,127),(240,2,127), (240,2,127), (240,2,127)]
+        link_pairs2 = [
+                [15, 13], [13, 11], [11, 5], 
+                [12, 14], [14, 16], [12, 6], 
+                [9, 7], [7,5], [5, 6], [6, 8], [8, 10],
+                [3, 1],[1, 2],[1, 0],[0, 2],[2,4],
+                ]
+        point_color2 = [(240,2,127),(240,2,127),(240,2,127), 
+                    (240,2,127), (240,2,127), 
+                    (255,255,0),(169, 209, 142),
+                    (255,255,0),(169, 209, 142),
+                    (255,255,0),(169, 209, 142),
+                    (252,176,243),(0,176,240),(252,176,243),
+                    (0,176,240),(252,176,243),(0,176,240),
+                    (255,255,0),(169, 209, 142),
+                    (255,255,0),(169, 209, 142),
+                    (255,255,0),(169, 209, 142)]
+        super().__init__(color2, link_pairs2, point_color2)
 
-#Visualization type used when we do inference
-#SKELETON paints the visualization with the joints and bones on every frame
-#BBOX creates red boxes demarkating where the bounding box model detected a box of the specific category, i.e. human
-#NONE, dont visualize the result just get the values
+    
+    def map_joint_dict(self,joints):
+        joints_dict = {}
+        for i in range(joints.shape[0]):
+            x = int(joints[i][0])
+            y = int(joints[i][1])
+            id = i
+            joints_dict[id] = (x, y)
+            
+        return joints_dict
 class VisType(Enum):
+    """
+    Simple enum for selecting what type of visualization to do
+    Visualization type used when we do inference
+    -SKELETON paints the visualization with the joints and bones on every frame
+    -BBOX creates red boxes demarkating where the bounding box model detected a box of the specific category, i.e. human
+    -NONE, dont visualize the result just get the values
+    """
     SKELETON = 1
     BBOX = 2
     NONE = 3
@@ -112,15 +119,6 @@ class PoseExtraction:
         assert torch.__version__ == "1.8.0+cu111"
         assert sys.version_info.major ==3
         assert sys.version_info.minor == 8
-    def save_output_video(self,dir,frames,framerate):
-        #make sure directory exists
-        os.makedirs(dir, exist_ok=True)
-        filename="out_" + datetime.datetime.now().strftime("%H_%M") + ".mp4"
-        output_path = os.path.join(dir,filename)
-        #convert the output frames to a video and save it
-        images_to_video(frames, output_path, framerate)
-        print("Wrote visualization video to " + str(output_path))
-
     #sets self.det_model,self.pose_model,self.dataset and self._dataset_info
     def init_models(self,detec_config,detec_checkpoint,pose_config,pose_checkpoint,device):
         self.det_model = init_detector(
@@ -157,8 +155,9 @@ class PoseExtraction:
         ax.add_patch(rectangle)
         video.release()
         return plt
-    #calculates the bounding box using the SOT model form mmtracking
-    def calculate_sot_bbox(self,init_bbox,input_video):
+    ###1
+    #calculates the bounding box using the SOT model from mmtracking
+    def calculate_sot_bbox(self,frames,init_bbox,start_frame_number,visualize=False):
         sot_config = Path("mmtracking_configs") / "sot" / "siamese_rpn" / "siamese_rpn_r50_20e_lasot.py"
         sot_config=str(sot_config.absolute())
         sot_checkpoint = Path("mmtracking_checkpoints") / "siamese_rpn_r50_1x_lasot_20211203_151612-da4b3c66.pth"
@@ -167,77 +166,138 @@ class PoseExtraction:
         sot_model = init_model(sot_config, sot_checkpoint, device='cuda:0')
         #xstart ystart xend yend?
 
-        imgs = mmcv.VideoReader(input_video)
-        prog_bar = mmcv.ProgressBar(len(imgs))
-        out_dir = tempfile.TemporaryDirectory()
-        out_path = out_dir.name
+        prog_bar = mmcv.ProgressBar(len(frames))
         result_lst = []
-        for i, img in enumerate(imgs):
-            result = inference_sot(sot_model, img, init_bbox, frame_id=i)
-            sot_model.show_result(
-                    img,
-                    result,
-                    wait_time=int(1000. / imgs.fps),
-                    out_file=f'{out_path}/{i:06d}.jpg')
-            prog_bar.update()
+        for i, frame in enumerate(frames):
+            result = inference_sot(sot_model, frame, init_bbox, frame_id=start_frame_number+i)
             result_lst.append(result)
-        #write the output video file
-        output = Path("output") / 'sot.mp4'
-        print(f'\n making the output video at {output} with a FPS of {imgs.fps}')
-        mmcv.frames2video(out_path, str(output.absolute()), fps=imgs.fps, fourcc='mp4v')
-        out_dir.cleanup() #removes the temporary .jpg files
+            prog_bar.update()
+            
+
         #rename the dict keys to match the other model, "bbox" is what PCT expects
         for elem in result_lst:
             elem["bbox"] = elem.pop("track_bboxes")
         return result_lst
-    
-    #takes in a video and sets everything except the larger bounding box to 0
-    def apply_bounding_box_mask(self,init_bbox,input_video,blur_amount=30):
-        bboxes = self.calculate_sot_bbox(init_bbox,input_video)
-        imgs = mmcv.VideoReader(input_video)
-        prog_bar = mmcv.ProgressBar(len(imgs))
-        frames_out = []
-        for i,frame in enumerate(imgs): 
-            out = crop_image_bbox(frame,bboxes[i]["bbox"])
-            out = out.astype(np.uint8)
-            out=cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-            frames_out.append(out) #inefficient but easy solution
+
+    ###2
+    def crop_video_bbox(self,frames,bboxes,visualize=False):
+        #since the video needs to be constant in resolution this
+        #calculates the largest width i.e. the width we want to set the new video to
+        def calc_max_box_width(bboxes):
+            max_dx = 0
+            for bbox in bboxes:
+                x1, y1, x2, y2,probs = bbox
+                if((x2-x1) > max_dx):
+                    max_dx= x2-x1
+            return max_dx
+        #same as calc_max_box_width but for height
+        def calc_max_box_height(bboxes):
+            max_dy = 0
+            for bbox in bboxes:
+                x1, y1, x2, y2,probs = bbox
+                if((y2-y1) > max_dy):
+                    max_dy= y2-y1
+            return max_dy
+
+        bboxes = [box["bbox"] for box in bboxes]
+        width = int(calc_max_box_width(bboxes))
+        height = int(calc_max_box_height(bboxes))
+        print("width,height:"+str((width,height)))
+        bboxes = np.round(bboxes).astype(np.int32)
+        prog_bar = mmcv.ProgressBar(len(frames))
+        cropped_frames=[]
+        for i,frame in enumerate(frames): 
+            x1, y1, x2, y2, prob = bboxes[i]
+            # Extract the region inside the bounding box
+            region = frame[y1:y2, x1:x2]
+            rescaled = cv2.resize(region, (width, height), interpolation=cv2.INTER_CUBIC)
+            cropped_frames.append(rescaled)
             prog_bar.update()
-        self.save_output_video("output",frames_out,imgs.fps)
+        return cropped_frames
+    ###3
+    #takes a cropped video and returns a scaled up version of the same video
+    def superres_video(self,frames):
+        print("NOTE: NO SUPERRESOLUTION IS BEING APPLIED USES BICUBIC INTERPOLATION")
+        resized_images = []
+        #temporary code that resizes it to the correct resolution 1920x1080 but w/o deep learning
+        for img in frames:
+            # cv2.resize expects the new size in (width, height) format
+            # img should be in numpy array format. If img is a PIL image, use np.array(img) to convert.
+            new_img = cv2.resize(img, (1920,1080), interpolation = cv2.INTER_CUBIC)
+            resized_images.append(new_img)
+        return resized_images
+    ###4
+    #takes a scaled up video and returns bboxes/segmentation of all persons
+    def yolo_segmentation(self,frames): 
+        # Load a model
+
+        model = YOLO('yolov8m-seg.pt')  # load an official segmentation model
+        #model = YOLO('path/to/best.pt')  # load a custom model
+
+        # Track with the model
+        results = model.track(source=frames,
+                            show=False,
+                            persist=True,
+                            tracker="bytetrack.yaml",
+                            classes=0,
+                            iou=0.3,
+                            conf=0.25,
+                            retina_masks=True,
+                            augment=True,
+                            max_det=2)
+        #reformat them on the format PCT wants
+        all_frames_boxes = []
+        for res in results:
+            boxes = np.array(res.boxes.xyxy.data.cpu()).round().astype(np.int32)  # Boxes object for bbox outputs
+            single_frame_boxes = []
+            for box in boxes:
+                single_frame_boxes.append({"bbox":box})
+            all_frames_boxes.append(single_frame_boxes)
+        return all_frames_boxes
+    ###5
     #modified version of PCT/vis_tools/demo_img_with_mmdet.py
     #calls the functions multiple time with a single frame
-    def video_inference(self,
-                        video_name,
+    def pct_pose_estimation(self,
+                        video_frames,
+                        bboxes_lst,
+                        bbox_threshold=None,
                         vis_type=VisType.NONE,
-                        framerate=1,#how many times a second to run the pose estimation
-                        video_folder="videos/",
-                        output_dir="output/",
                         thickness=2,
-                        bbox_threshold=0.3,
                         ):
-            video_path = os.path.join(video_folder, video_name)
-            
-            video_frames = extract_frames(video_path,sample_rate=framerate)
-            bboxes=None
-            with open('data_yolo.pkl', 'rb') as f:
-                bboxes = pickle.load(f)
-            output_data = []
+            #helper function to make the bboxes all 2 subarrays with 4 elements each
+            def pad_bbox_list(bboxes):
+                bboxes=[x["bbox"] for x in bboxes]
+                padded_lst = []
+                for arr in bboxes:
+                    if arr.size == 0:
+                        # if array is empty, create a new array of shape (2,4) filled with zeros
+                        arr = np.zeros((2, 4), dtype=int)
+                    else:
+                        # if array is not empty, pad it with zeros
+                        padding = ((0, 2 - arr.shape[0]), (0, 0))
+                        arr = np.pad(arr, pad_width=padding, mode='constant', constant_values=0)
+                    padded_lst.append(arr)
+
+                padded_lst = [{"bbox":x} for x in padded_lst]
+                return padded_lst
+            human_poses = []
             output_frames = []
             framecount = 0
-            for frame in tqdm(video_frames, desc="Processing frames", unit="frames"):
-                # test a single image, the resulting box is (x1, y1, x2, y2)
-                mmdet_results = inference_detector(self.det_model, frame)
-                # keep the person class bounding boxes.
-                #person_results = process_mmdet_results(mmdet_results, self.cat_id)
-
-                # test a single image, with a list of bboxes.
-
-                # optional
-                return_heatmap = False
-
-                # e.g. use ('backbone', ) to return backbone feature
-                output_layer_names = None
-
+            # optional
+            return_heatmap = False
+            # e.g. use ('backbone', ) to return backbone feature
+            output_layer_names = None
+            
+            
+            #for each frame get the poses for all the people that were detected in that frame
+            #done automatically in the inference_top_down
+            prog_bar = mmcv.ProgressBar(len(video_frames))
+            for i,frame in enumerate(video_frames):
+                #only run the pose detection if there is atleast one person detected
+                bboxes=bboxes_lst[i]
+                if(bboxes == []):
+                    human_poses.append([])#keeps the frame number and poses aligned
+                    continue
                 #can be given a list of images from memory
                 pose_results, returned_outputs = inference_top_down_pose_model(
                     self.pose_model,
@@ -250,9 +310,10 @@ class PoseExtraction:
                     return_heatmap=return_heatmap,
                     outputs=output_layer_names)
                 
-                output_data.append(pose_results)
-                
+                human_poses.append(pose_results)
+                prog_bar.update() 
                 # show the results depending on vis
+                """
                 if vis_type==VisType.SKELETON:
                     out_frame = vis_pose_result_np(
                         frame,
@@ -266,11 +327,128 @@ class PoseExtraction:
                     thickness=thickness)
                     output_frames.append(out_frame)
 
-                framecount += 1
-            if vis_type != VisType.NONE:
-                self.save_output_video(output_dir,output_frames,framerate)
-            print("Total frames processed: "+str(framecount))
-            #return output_data
+                    framecount += 1
+                if vis_type != VisType.NONE:
+                    self.save_output_video(output_dir,output_frames,framerate)
+                print("Total frames processed: "+str(framecount)
+                """
+            return human_poses
+    #called if visualize=True of a certain step 1-5
+    def write_current_video():
+        sot_model.show_result(
+                    img,
+                    result,
+                    wait_time=int(1000. / imgs.fps),
+                    out_file=f'{out_path}/{i:06d}.jpg')
+        output = Path("output") / 'sot.mp4'
+        print(f'\n making the output video at {output} with a FPS of {imgs.fps}')
+        mmcv.frames2video(out_path, str(output.absolute()), fps=imgs.fps, fourcc='mp4v')
+        out_dir.cleanup() #removes the temporary .jpg files
+    #writes each frame of the video to the temp folder where we store the images while we process them
+    def setup_frames_data_dir(self,video_path):
+        #video_path = Path(video_folder) / video_name
+        print(video_path)
+        #we assume the file sits in ./uploaded/video_name
+        # Open the video
+        cap = cv2.VideoCapture(str(video_path))
+
+        # Check if camera opened successfully
+        if (cap.isOpened() == False): 
+            print("Unable to read camera feed")
+
+        frame_count = 0
+        print("writing each frame of video to " + str(self.image_folder))
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if not os.path.exists(self.image_folder):
+            os.makedirs(self.image_folder)
+
+        with tqdm(total=total_frames, unit='frame', ncols=70, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
+            while(True):
+                ret, frame = cap.read()
+
+                if ret == True: 
+                    # Write the frame into the file 'self.image_folder/frame_count.jpg'
+                    frame_name =  f'frame_{str(frame_count).zfill(6)}.jpg'
+                    frame_path = os.path.join(self.image_folder,frame_name)
+                    cv2.imwrite(frame_path, frame)
+                    frame_count += 1
+                    pbar.update(1)
+                # Break the loop if video is ended
+                else:
+                    break 
+
+        # When everything done, release the video capture and video write objects
+        cap.release()
+    #just deletes the temp folder where we stored the images during processing
+    def delete_frames_data_dir(self):
+        shutil.rmtree(self.image_folder)
+    
+    #returns up to batch_size number of images from the temp directory of image frames
+    #all n-1 batches is 100 long and last batch is the remaining images
+    def load_image_batch(self,batch_size):
+        all_image_files = glob.glob(os.path.join(self.image_folder, '*.jpg'))
+        
+        for i in range(0, len(all_image_files), batch_size):
+            batch_files = all_image_files[i:i + batch_size]
+            batch_images = []
+            
+            for file in batch_files:
+                img = cv2.imread(file)
+                batch_images.append(img)
+            
+            yield batch_images
+    #does the entire transformation we want, from video to poses
+    #crop_video_bbox crops to one size per batch but thats okay since we upscale them to 1080x1920,note: causes visualizations of this step to be different size
+    #pct_pose_estimation uses the upscaled frames so we dont need to translate the postion of the bbox to the original video
+    def end_to_end(self,video,init_bbox):
+        self.setup_frames_data_dir(video)
+        human_poses=[]
+        for batch in self.load_image_batch(100):
+            #1-5
+            sot_bbox_batch=self.calculate_sot_bbox(batch,init_bbox)
+            cropped_batch=self.crop_video_bbox(batch,sot_bbox_batch)
+            upscaled_batch=self.superres_video(cropped_batch)
+            human_bboxes_batch=self.yolo_segmentation(upscaled_batch)
+            human_poses_batch=self.pct_pose_estimation(upscaled_batch,human_bboxes_batch)
+            
+            #append and set init_bbox for next iteration
+            human_poses.append(human_poses_batch)
+            init_bbox=sot_bbox_batch[-1]["bbox"] #[]"bbox"] because its a map
+        self.delete_frames_data_dir()
+        return human_poses
+    def __init__(self,
+                 parent_path,
+                 debug=True,
+                 detec_config="vis_tools/cascade_rcnn_x101_64x4d_fpn_coco.py",
+                 detec_checkpoint="https://download.openmmlab.com/mmdetection/v2.0/cascade_rcnn/cascade_rcnn_x101_64x4d_fpn_20e_coco/cascade_rcnn_x101_64x4d_fpn_20e_coco_20200509_224357-051557b1.pth",
+                 model_size="base",
+                 device = "cuda:0"
+                 ) -> None:
+        #make sure all packages are the right version
+        self.check_env()
+
+        self.parent_path=parent_path
+        self.image_folder = parent_path / Path("temp")
+
+        pose_config=Path("configs") / f"pct_{model_size}_classifier.py"
+        pose_config=str(pose_config.absolute())
+        pose_checkpoint=Path("weights") / "pct" / f"swin_{model_size}.pth"
+        pose_checkpoint=str(pose_checkpoint.absolute())
+        self.cat_id = 1 #Category id for bounding box detection model, 1 corresponds to person?
+        
+        #initialize the models
+        self.init_models(detec_config,detec_checkpoint,pose_config,pose_checkpoint,device)
+
+    #CHANGE OR MOVE
+    def save_output_video(self,dir,frames,framerate):
+        #make sure directory exists
+        os.makedirs(dir, exist_ok=True)
+        filename="out_" + datetime.datetime.now().strftime("%H_%M") + ".mp4"
+        output_path = os.path.join(dir,filename)
+        #convert the output frames to a video and save it
+        images_to_video(frames, output_path, framerate)
+        print("Wrote visualization video to " + str(output_path))
     def zoom(self,image, zoom_factor):
         height, width, _ = image.shape
 
@@ -290,7 +468,6 @@ class PoseExtraction:
         zoomed_image = cv2.resize(roi, (width, height), interpolation=cv2.INTER_CUBIC)
 
         return zoomed_image
-
     def zoom_video(self,input_video, output_video_path, zoom_factor):
         imgs = mmcv.VideoReader(input_video)
         prog_bar = mmcv.ProgressBar(len(imgs))
@@ -302,60 +479,13 @@ class PoseExtraction:
             frames_out.append(out) #inefficient but easy solution
             prog_bar.update()
         self.save_output_video("output",frames_out,imgs.fps)
-    def __init__(self,
-                 detec_config="vis_tools/cascade_rcnn_x101_64x4d_fpn_coco.py",
-                 detec_checkpoint="https://download.openmmlab.com/mmdetection/v2.0/cascade_rcnn/cascade_rcnn_x101_64x4d_fpn_20e_coco/cascade_rcnn_x101_64x4d_fpn_20e_coco_20200509_224357-051557b1.pth",
-                 model_size="base",
-                 device = "cuda:0"
-                 ) -> None:
-        #make sure all packages are the right version
-        self.check_env()
-
-        pose_config=Path("configs") / f"pct_{model_size}_classifier.py"
-        pose_config=str(pose_config.absolute())
-        pose_checkpoint=Path("weights") / "pct" / f"swin_{model_size}.pth"
-        pose_checkpoint=str(pose_checkpoint.absolute())
-        self.cat_id = 1 #Category id for bounding box detection model, 1 corresponds to person?
-        
-        #initialize the models
-        self.init_models(detec_config,detec_checkpoint,pose_config,pose_checkpoint,device)
 
 ##Below functions are outside of the class since they are not meant to be called directly  
-def calc_max_box_delta_x(bboxes):
-    max_dx = 0
-    for bbox in bboxes:
-        x1, y1, x2, y2,probs = bbox
-        if((x2-x1) > max_dx):
-            max_dx= x2-x1
-    return max_dx
-def calc_max_box_y(bboxes):
-    max_dy = 0
-    for bbox in bboxes:
-        x1, y1, x2, y2,probs = bbox
-        if((y2-y1) > max_dy):
-            max_dy= y2-y1
-    return max_dy
 
 #get just the inside, extracts what is inside the bbox in each frame, then scales it up with bicubic to the specified width height
 #the idea is that width,height come from the largest x_delta and y_delta of all the frames
 #useful since instead of getting a normal size video with smeared pixels it gets a small video with normal "size pixels"
 #although cant tell the difference when you watch it in media player as they get treated the same
-def crop_video(video_path, bounding_boxes, output_dir, width, height):
-    imgs = mmcv.VideoReader(video_path)
-    prog_bar = mmcv.ProgressBar(len(imgs))
-    # Get video properties
-    fps = imgs.fps
-
-    # Define the codec and create VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
-    out = cv2.VideoWriter(f'{output_dir}/output.mp4', fourcc, fps, (int(width), int(height)))
-    for i,frame in enumerate(imgs): 
-        x1, y1, x2, y2, prob = bounding_boxes[i]
-        # Extract the region inside the bounding box
-        region = frame[y1:y2, x1:x2]
-        rescaled = cv2.resize(region, (width, height), interpolation=cv2.INTER_CUBIC)
-        out.write(rescaled)
-        prog_bar.update()
 #offset is a "padding" in all directions
 def crop_image_bbox(image,bbox,offset=0):
     bbox = bbox.astype(np.int32)
@@ -462,10 +592,12 @@ def vis_pose_result_np(data_numpy, pose_results, thickness):
     ax = plt.subplot(1,1,1)
     bk = plt.imshow(data_numpy[:,:,::-1])
     bk.set_zorder(-1)
+    #helps define colors for the visualization of bones
+    chunhua_style=ChunhuaStyle()
     
     for i, dt in enumerate(pose_results[:]):
         dt_joints = np.array(dt['keypoints']).reshape(17,-1)
-        joints_dict = map_joint_dict(dt_joints)
+        joints_dict = chunhua_style.map_joint_dict(dt_joints)
         
         # stick 
         for k, link_pair in enumerate(chunhua_style.link_pairs):
