@@ -1,3 +1,5 @@
+torch==1.8.0+cu111
+torchvision==0.9.0+cu111
 addict==2.4.0
 albumentations==1.3.1
 attributee==0.1.8
@@ -67,8 +69,6 @@ threadpoolctl==3.1.0
 tifffile==2023.4.12
 timm==0.9.2
 tomli==2.0.1
-torch==1.8.0+cu111
-torchvision==0.9.0+cu111
 tqdm==4.65.0
 trackeval==1.0.dev1
 ultralytics==8.0.125
