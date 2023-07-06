@@ -216,6 +216,7 @@ class PoseExtraction:
         return cropped_frames
     ###3
     #takes a cropped video and returns a scaled up version of the same video
+    #NOTE: the license for rvrt is non-commercial
     def superres_video(self,frames):
         print("NOTE: NO SUPERRESOLUTION IS BEING APPLIED USES BICUBIC INTERPOLATION")
         resized_images = []
