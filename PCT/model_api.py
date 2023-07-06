@@ -388,7 +388,7 @@ class PoseExtraction:
     #all n-1 batches is 100 long and last batch is the remaining images
     def load_image_batch(self,batch_size):
         all_image_files = glob.glob(os.path.join(self.image_folder, '*.jpg'))
-        
+        all_image_files.sort()
         for i in range(0, len(all_image_files), batch_size):
             batch_files = all_image_files[i:i + batch_size]
             batch_images = []
@@ -427,7 +427,8 @@ class PoseExtraction:
                  ) -> None:
         #make sure all packages are the right version
         self.check_env()
-
+        if not os.path.exists("./videos"):
+            os.makedirs("./videos")
         self.parent_path=parent_path
         self.image_folder = parent_path / Path("temp")
 
