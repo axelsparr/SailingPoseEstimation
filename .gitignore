@@ -1,6 +1,7 @@
 *.pth
 *.mp4
 *.jpg
+*.png
 *.mov
 *.MOV
 /PCT/videos/
