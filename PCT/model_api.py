@@ -386,8 +386,11 @@ class PoseExtraction:
     
     #returns up to batch_size number of images from the temp directory of image frames
     #all n-1 batches is 100 long and last batch is the remaining images
-    def load_image_batch(self,batch_size):
-        all_image_files = glob.glob(os.path.join(self.image_folder, '*.jpg'))
+    def load_image_batch(self,batch_size,filetype="jpg",path=None):
+        if path == None:
+            all_image_files = glob.glob(os.path.join(self.image_folder, f'*.{filetype}'))
+        else:
+            all_image_files = glob.glob(os.path.join(path, f'*.{filetype}'))
         all_image_files.sort()
         for i in range(0, len(all_image_files), batch_size):
             batch_files = all_image_files[i:i + batch_size]
