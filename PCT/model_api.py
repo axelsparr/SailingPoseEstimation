@@ -31,6 +31,8 @@ from enum import Enum
 from pathlib import Path
 import contextlib
 import shutil
+import requests
+import logging
 
 import mmtrack
 import mmdet
@@ -38,10 +40,21 @@ from mmtrack.apis import inference_sot,inference_mot, init_model
 import tempfile
 import mmcv
 import tempfile
-import cv2
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import pickle
+
+import argparse
+from collections import OrderedDict
+from torch.utils.data import DataLoader
+import tarfile
+
+
+from RVRT.models.network_rvrt import RVRT as net
+from RVRT.utils import utils_image as util
+from RVRT.data.dataset_video_test import VideoRecurrentTestDataset, VideoTestVimeo90KDataset, SingleVideoRecurrentTestDataset
+from RVRT.main_test_rvrt import prepare_model_dataset,test_video,test_clip
+###rewritten version of main in RVRT/main_test_rvrt.py
 
 class ColorStyle:
     """
@@ -105,6 +118,12 @@ class VisType(Enum):
     SKELETON = 1
     BBOX = 2
     NONE = 3
+class UpscaleType(Enum):
+    """
+    used for selecting what type of upscaling to use in superres_video
+    """
+    BICUBIC=1
+    RVRT=2
 class PoseExtraction:
     def check_env(self):
         """
@@ -155,6 +174,122 @@ class PoseExtraction:
         ax.add_patch(rectangle)
         video.release()
         return plt
+    #rewrite of main in main_test_rvrt
+    def run_rvrt(task='001_RVRT_videosr_bi_REDS_30frames', sigma=0,
+         folder_lq='testsets/REDS4/sharp_bicubic', folder_gt=None,
+         tile=[100,128,128], tile_overlap=[2,20,20],
+         num_workers=16, save_result=False):
+
+        # define model
+        device = torch.device('cuda')
+        args = argparse.Namespace(task=task, sigma=sigma, folder_lq=folder_lq, folder_gt=folder_gt,
+                                tile=tile, tile_overlap=tile_overlap, num_workers=num_workers,
+                                save_result=save_result)
+        model = prepare_model_dataset(args)
+        model.eval()
+        model = model.to(device)
+
+        # define model
+        device = torch.device('cuda')
+        model = prepare_model_dataset(args)
+        model.eval()
+        model = model.to(device)
+        if 'vimeo' in args.folder_lq.lower():
+            test_set = VideoTestVimeo90KDataset({'dataroot_gt':args.folder_gt, 'dataroot_lq':args.folder_lq,
+                                            'meta_info_file': "data/meta_info/meta_info_Vimeo90K_test_GT.txt",
+                                                'mirror_sequence': True, 'num_frame': 7, 'cache_data': False})
+        elif args.folder_gt is not None:
+            test_set = VideoRecurrentTestDataset({'dataroot_gt':args.folder_gt, 'dataroot_lq':args.folder_lq,
+                                                'sigma':args.sigma, 'num_frame':-1, 'cache_data': False})
+        else:
+            test_set = SingleVideoRecurrentTestDataset({'dataroot_gt':args.folder_gt, 'dataroot_lq':args.folder_lq,
+                                                'sigma':args.sigma, 'num_frame':-1, 'cache_data': False})
+
+        test_loader = DataLoader(dataset=test_set, num_workers=args.num_workers, batch_size=1, shuffle=False)
+
+        save_dir = f'results/{args.task}'
+        if args.save_result:
+            os.makedirs(save_dir, exist_ok=True)
+        test_results = OrderedDict()
+        test_results['psnr'] = []
+        test_results['ssim'] = []
+        test_results['psnr_y'] = []
+        test_results['ssim_y'] = []
+
+        assert len(test_loader) != 0, f'No dataset found at {args.folder_lq}'
+
+        for idx, batch in enumerate(test_loader):
+            lq = batch['L'].to(device)
+            folder = batch['folder']
+            gt = batch['H'] if 'H' in batch else None
+
+            # inference
+            with torch.no_grad():
+                output = test_video(lq, model, args)
+
+            if 'vimeo' in args.folder_lq.lower():
+                output = (output[:, 3:4, :, :, :] + output[:, 10:11, :, :, :]) / 2
+                batch['lq_path'] = batch['gt_path']
+
+            test_results_folder = OrderedDict()
+            test_results_folder['psnr'] = []
+            test_results_folder['ssim'] = []
+            test_results_folder['psnr_y'] = []
+            test_results_folder['ssim_y'] = []
+
+            for i in range(output.shape[1]):
+                # save image
+                img = output[:, i, ...].data.squeeze().float().cpu().clamp_(0, 1).numpy()
+                if img.ndim == 3:
+                    img = np.transpose(img[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
+                img = (img * 255.0).round().astype(np.uint8)  # float32 to uint8
+                if args.save_result:
+                    seq_ = os.path.basename(batch['lq_path'][i][0]).split('.')[0]
+                    os.makedirs(f'{save_dir}/{folder[0]}', exist_ok=True)
+                    cv2.imwrite(f'{save_dir}/{folder[0]}/{seq_}.png', img)
+
+                # evaluate psnr/ssim
+                if gt is not None:
+                    img_gt = gt[:, i, ...].data.squeeze().float().cpu().clamp_(0, 1).numpy()
+                    if img_gt.ndim == 3:
+                        img_gt = np.transpose(img_gt[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
+                    img_gt = (img_gt * 255.0).round().astype(np.uint8)  # float32 to uint8
+                    img_gt = np.squeeze(img_gt)
+
+                    test_results_folder['psnr'].append(util.calculate_psnr(img, img_gt, border=0))
+                    test_results_folder['ssim'].append(util.calculate_ssim(img, img_gt, border=0))
+                    if img_gt.ndim == 3:  # RGB image
+                        img = util.bgr2ycbcr(img.astype(np.float32) / 255.) * 255.
+                        img_gt = util.bgr2ycbcr(img_gt.astype(np.float32) / 255.) * 255.
+                        test_results_folder['psnr_y'].append(util.calculate_psnr(img, img_gt, border=0))
+                        test_results_folder['ssim_y'].append(util.calculate_ssim(img, img_gt, border=0))
+                    else:
+                        test_results_folder['psnr_y'] = test_results_folder['psnr']
+                        test_results_folder['ssim_y'] = test_results_folder['ssim']
+
+            if gt is not None:
+                psnr = sum(test_results_folder['psnr']) / len(test_results_folder['psnr'])
+                ssim = sum(test_results_folder['ssim']) / len(test_results_folder['ssim'])
+                psnr_y = sum(test_results_folder['psnr_y']) / len(test_results_folder['psnr_y'])
+                ssim_y = sum(test_results_folder['ssim_y']) / len(test_results_folder['ssim_y'])
+                test_results['psnr'].append(psnr)
+                test_results['ssim'].append(ssim)
+                test_results['psnr_y'].append(psnr_y)
+                test_results['ssim_y'].append(ssim_y)
+                print('Testing {:20s} ({:2d}/{}) - PSNR: {:.2f} dB; SSIM: {:.4f}; PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}'.
+                        format(folder[0], idx, len(test_loader), psnr, ssim, psnr_y, ssim_y))
+            else:
+                print('Testing {:20s}  ({:2d}/{})'.format(folder[0], idx, len(test_loader)))
+
+        # summarize psnr/ssim
+        if gt is not None:
+            ave_psnr = sum(test_results['psnr']) / len(test_results['psnr'])
+            ave_ssim = sum(test_results['ssim']) / len(test_results['ssim'])
+            ave_psnr_y = sum(test_results['psnr_y']) / len(test_results['psnr_y'])
+            ave_ssim_y = sum(test_results['ssim_y']) / len(test_results['ssim_y'])
+            print('\n{} \n-- Average PSNR: {:.2f} dB; SSIM: {:.4f}; PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}'.
+                format(save_dir, ave_psnr, ave_ssim, ave_psnr_y, ave_ssim_y))
+
     ###1
     #calculates the bounding box using the SOT model from mmtracking
     def calculate_sot_bbox(self,frames,init_bbox,start_frame_number,visualize=False):
@@ -217,15 +352,18 @@ class PoseExtraction:
     ###3
     #takes a cropped video and returns a scaled up version of the same video
     #NOTE: the license for rvrt is non-commercial
-    def superres_video(self,frames):
-        print("NOTE: NO SUPERRESOLUTION IS BEING APPLIED USES BICUBIC INTERPOLATION")
-        resized_images = []
-        #temporary code that resizes it to the correct resolution 1920x1080 but w/o deep learning
-        for img in frames:
-            # cv2.resize expects the new size in (width, height) format
-            # img should be in numpy array format. If img is a PIL image, use np.array(img) to convert.
-            new_img = cv2.resize(img, (1920,1080), interpolation = cv2.INTER_CUBIC)
-            resized_images.append(new_img)
+    def superres_video(self,frames,upscale_type=UpscaleType.BICUBIC):
+        if upscale_type == UpscaleType.BICUBIC:
+            resized_images = []
+            #temporary code that resizes it to the correct resolution 1920x1080 but w/o deep learning
+            for img in frames:
+                # cv2.resize expects the new size in (width, height) format
+                # img should be in numpy array format. If img is a PIL image, use np.array(img) to convert.
+                new_img = cv2.resize(img, (1920,1080), interpolation = cv2.INTER_CUBIC)
+                resized_images.append(new_img)
+        elif upscale_type == UpscaleType.RVRT:
+            #create the directory
+            raise NotImplementedError
         return resized_images
     ###4
     #takes a scaled up video and returns bboxes/segmentation of all persons
@@ -385,6 +523,11 @@ class PoseExtraction:
     def delete_frames_data_dir(self):
         shutil.rmtree(self.image_folder)
     
+    def write_cropped_images(self,cropped_batch,start_frame):
+        for i,frame in enumerate(cropped_batch):
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert the image from BGR to RGB
+                        pil_image = Image.fromarray(frame_rgb)
+                        pil_image.save(str(Path("temp") / Path("upscaled") / Path(f"img_{start_frame+i:06}.jpg")))
     #returns up to batch_size number of images from the temp directory of image frames
     #all n-1 batches is 100 long and last batch is the remaining images
     def load_image_batch(self,batch_size,filetype="jpg",path=None):
@@ -402,28 +545,111 @@ class PoseExtraction:
                 batch_images.append(img)
             
             yield batch_images
+    #creates the black lines
+    def new_vis_pose_result_np(self,data_numpy, pose_results, thickness):
+        # Copy the image so we don't draw on top of the original
+        img = data_numpy.copy()
+        
+        # ChunhuaStyle() equivalent in cv2
+        chunhua_style = ChunhuaStyle()
+        
+        for i, dt in enumerate(pose_results):
+            dt_joints = np.array(dt['keypoints']).reshape(17,-1)
+            joints_dict = chunhua_style.map_joint_dict(dt_joints)
+            
+            # draw sticks/lines
+            for k, link_pair in enumerate(chunhua_style.link_pairs):
+                if k in range(11,16):
+                    lw = thickness
+                else:
+                    lw = thickness * 2
+                    
+                # map color to BGR for cv2
+                color_bgr = (link_pair[2][2], link_pair[2][1], link_pair[2][0])
+                
+                pt1 = tuple(int(x) for x in joints_dict[link_pair[0]])
+                pt2 = tuple(int(x) for x in joints_dict[link_pair[1]])
+                cv2.line(img, pt1, pt2, color_bgr, thickness=lw)
+
+            # draw circles
+            for k in range(dt_joints.shape[0]):
+                if k in range(5):
+                    radius = thickness
+                else:
+                    radius = thickness * 2
+                    
+                center = tuple(int(x) for x in dt_joints[k,:2])
+                
+                # map color to BGR for cv2
+                ring_color_bgr = (chunhua_style.ring_color[k][2], chunhua_style.ring_color[k][1], chunhua_style.ring_color[k][0])
+                
+                cv2.circle(img, center, radius, (0,0,0), thickness=-1) # black border
+                cv2.circle(img, center, radius-1, ring_color_bgr, thickness=-1) # fill
+                
+        return img
+    def create_video(self,human_poses):
+        img_files = glob.glob(os.path.join(Path("./temp"), '*.jpg')) #only take jpg files
+        img_files.sort()  # make sure that the images are in order
+
+        # Read the first file to get the size and color information
+        img = cv2.imread(img_files[0])
+        height, width, layers = img.shape
+        size = (width,height)
+
+        # Create a VideoWriter object
+        out = cv2.VideoWriter('output_3.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 30, size)
+        prog_bar = mmcv.ProgressBar(len(img_files))
+        prev_pose = []#no pose until first frame that has a pose
+        for i,img_file in enumerate(img_files):
+            img = cv2.imread(img_file)
+            if(human_poses[i] != []):
+                processed_img = cv2.resize(self.new_vis_pose_result_np(img,human_poses[i],1),(1920,1080))
+                out.write(processed_img)
+                prev_pose=human_poses[i]
+            else:
+                #use prev frames skeleton
+                processed_img = cv2.resize(self.new_vis_pose_result_np(img,prev_pose,1),(1920,1080))
+                out.write(img)
+            prog_bar.update()
+
+        out.release()
     #does the entire transformation we want, from video to poses
     #crop_video_bbox crops to one size per batch but thats okay since we upscale them to 1080x1920,note: causes visualizations of this step to be different size
     #pct_pose_estimation uses the upscaled frames so we dont need to translate the postion of the bbox to the original video
-    def end_to_end(self,video,init_bbox):
+    def end_to_end(self,video,init_bbox,image_batch_size=100,debug=False):
+        original_stdout = sys.stdout
+        if not debug:
+            sys.stdout = open(os.devnull, 'w')
         self.setup_frames_data_dir(video)
+        #num_batches = len(glob.glob(str(self.image_folder / Path("*.jpg")))) // image_batch_size
+        #prog_bar = mmcv.ProgressBar(num_batches +1)
         human_poses=[]
-        for batch in self.load_image_batch(100):
+        upscaled_frames = []
+        start_frame = 0
+        human_bboxes_all=[]
+        for batch in self.load_image_batch(image_batch_size):
             #1-5
-            sot_bbox_batch=self.calculate_sot_bbox(batch,init_bbox)
+            sot_bbox_batch=self.calculate_sot_bbox(batch,init_bbox,0)
             cropped_batch=self.crop_video_bbox(batch,sot_bbox_batch)
             upscaled_batch=self.superres_video(cropped_batch)
             human_bboxes_batch=self.yolo_segmentation(upscaled_batch)
+            human_bboxes_all.append(human_bboxes_batch)
             human_poses_batch=self.pct_pose_estimation(upscaled_batch,human_bboxes_batch)
             
-            #append and set init_bbox for next iteration
-            human_poses.append(human_poses_batch)
-            init_bbox=sot_bbox_batch[-1]["bbox"] #[]"bbox"] because its a map
-        self.delete_frames_data_dir()
+            #append and set init_bbox for next iteration, and increment starting frame for next batch
+            for item in human_poses_batch:
+                human_poses.append(item)
+            if not os.path.exists(str((Path("temp") / Path("upscaled")))):
+                    os.makedirs(str((Path("temp") / Path("upscaled"))))
+            self.write_cropped_images(cropped_batch,start_frame)
+            init_bbox=sot_bbox_batch[-1]["bbox"][:4] #[]"bbox"] because its a map, [:4] to ditch the probability
+            start_frame+=len(batch)
+        #p.delete_frames_data_dir()
+        sys.stdout = original_stdout
         return human_poses
     def __init__(self,
                  parent_path,
-                 debug=True,
+                 debug=False,
                  detec_config="vis_tools/cascade_rcnn_x101_64x4d_fpn_coco.py",
                  detec_checkpoint="https://download.openmmlab.com/mmdetection/v2.0/cascade_rcnn/cascade_rcnn_x101_64x4d_fpn_20e_coco/cascade_rcnn_x101_64x4d_fpn_20e_coco_20200509_224357-051557b1.pth",
                  model_size="base",
@@ -431,6 +657,7 @@ class PoseExtraction:
                  ) -> None:
         #make sure all packages are the right version
         self.check_env()
+        
         if not os.path.exists("./videos"):
             os.makedirs("./videos")
         self.parent_path=parent_path
@@ -442,9 +669,60 @@ class PoseExtraction:
         pose_checkpoint=str(pose_checkpoint.absolute())
         self.cat_id = 1 #Category id for bounding box detection model, 1 corresponds to person?
         
+        #download the SOT and PCT weights if needed
+        self.check_sot_weights_present()
+        self.check_pct_weights_present()
+        #if debug is false silence all the outputs of the models when they init
+        original_stdout = sys.stdout 
+        if debug==False:
+            logging.getLogger().setLevel(logging.CRITICAL)
+            sys.stdout = open(os.devnull, 'w')
         #initialize the models
         self.init_models(detec_config,detec_checkpoint,pose_config,pose_checkpoint,device)
+        #restore prints
+        sys.stdout = original_stdout
+    def check_pct_weights_present(self):
+        """
+        same as check_sot_weights_present but with a loop and downloads a tar from google drive,
+        couldnt download from the paper link in python
+        """
+        def weights_folder_correct():
+            files = ["./weights/pct/swin_base.pth","./weights/heatmap/swin_base.pth","./weights/simmim/swin_base.pth","./weights/tokenizer/swin_base.pth"]
+            for file in files:
+                if not os.path.isfile(file):
+                    return False
+            return True
+        if(not weights_folder_correct()):
+            #create folder
+            if not os.path.exists("./weights"):
+                os.makedirs("./weights")
+            #download tar file
+            url=r"https://drive.google.com/u/0/uc?id=12pxN3W2UTl7jRSlAu4wHDJkZaPG1oCDB&export=download&confirm=t&uuid=ada72c11-0255-4279-8283-dee8d324b339&at=AKKF8vzTGxHbGT2OYJdDym0HqElj:1688581673447"
+            response = requests.get(url, allow_redirects=True)
+            open('weights.tar', 'wb').write(response.content)
 
+            #untar it
+            tar = tarfile.open("weights.tar")
+            tar.extractall()
+            tar.close()
+            #clean up tar file
+            os.remove("weights.tar")
+    def check_sot_weights_present(self):
+        """
+        checks if the checkpoint files for the pretrained models are in the correct place
+        if not downloads them
+        """
+        if not os.path.exists("./mmtracking_checkpoints"):
+                    os.makedirs("./mmtracking_checkpoints")
+        if not os.path.isfile(Path("mmtracking_checkpoints") / Path("selsa_faster_rcnn_r50_dc5_1x_imagenetvid_20201227_204835-2f5a4952.pth")):
+            print("downloading selsa_faster_rcnn_r50")
+            download_and_write_file("https://download.openmmlab.com/mmtracking/vid/selsa/selsa_faster_rcnn_r50_dc5_1x_imagenetvid/selsa_faster_rcnn_r50_dc5_1x_imagenetvid_20201227_204835-2f5a4952.pth","mmtracking_checkpoints")
+        if not os.path.isfile(Path("mmtracking_checkpoints") / Path("siamese_rpn_r50_1x_lasot_20211203_151612-da4b3c66.pth")):
+            print("downloading siamese rpn")
+            download_and_write_file("https://download.openmmlab.com/mmtracking/sot/siamese_rpn/siamese_rpn_r50_1x_lasot/siamese_rpn_r50_1x_lasot_20211203_151612-da4b3c66.pth","mmtracking_checkpoints")
+        if not os.path.isfile(Path("mmtracking_checkpoints") / Path("masktrack_rcnn_r50_fpn_12e_youtubevis2019_20211022_194830-6ca6b91e.pth")):
+            print("downloading masktrack rcnn")
+            download_and_write_file("https://download.openmmlab.com/mmtracking/vis/masktrack_rcnn/masktrack_rcnn_r50_fpn_12e_youtubevis2019/masktrack_rcnn_r50_fpn_12e_youtubevis2019_20211022_194830-6ca6b91e.pth","mmtracking_checkpoints")
     #CHANGE OR MOVE
     def save_output_video(self,dir,frames,framerate):
         #make sure directory exists
@@ -486,56 +764,16 @@ class PoseExtraction:
         self.save_output_video("output",frames_out,imgs.fps)
 
 ##Below functions are outside of the class since they are not meant to be called directly  
+def download_and_write_file(url,destination_folder):
+    response = requests.get(url, stream=True)
 
-#get just the inside, extracts what is inside the bbox in each frame, then scales it up with bicubic to the specified width height
-#the idea is that width,height come from the largest x_delta and y_delta of all the frames
-#useful since instead of getting a normal size video with smeared pixels it gets a small video with normal "size pixels"
-#although cant tell the difference when you watch it in media player as they get treated the same
-#offset is a "padding" in all directions
-def crop_image_bbox(image,bbox,offset=0):
-    bbox = bbox.astype(np.int32)
-    #bbox = [int(coord) for coord in bbox]
-    x1, y1, x2, y2, prob = bbox+offset
+    file_size = int(response.headers.get('Content-Length', 0))
+    file_name = url.split("/")[-1]
+    destination_path = os.path.join(destination_folder, file_name)
 
-    # Extract the region inside the bounding box
-    region = image[y1:y2, x1:x2]
-    # Get the original image dimensions
-    height, width = image.shape[:2]
-
-    # Rescale the region to fit the original image size
-    rescaled = cv2.resize(region, (width, height), interpolation=cv2.INTER_CUBIC)
-    return rescaled
-#applies gaussian blur to all pixels outside the specified box and returns the image,opencv can handle np arrays directly
-def blur_all_pixels_outside_bbox(image,bbox,blur_amount=30):
-    bbox = bbox.astype(np.int32)
-    #bbox = [int(coord) for coord in bbox]
-    x1, y1, x2, y2, prob = bbox
-    blurred_image = image.copy()
-    # Apply a Gaussian blur to the copy of the image
-    blurred_image = cv2.GaussianBlur(blurred_image, (99,99), blur_amount)
-
-    # Paste the non-blurred region back onto the blurred image
-    blurred_image[y1:y2, x1:x2] = image[y1:y2, x1:x2]
-    return blurred_image
-
-#takes in a video frame as an np array and sets all pixels outside the bbox in x1,y1,x2,y2 format to 0,0,0
-def set_pixels_outside_bbox_black(image, rectangle):
-        # Ensure value is an array
-    value = np.array([0,0,0])
-    image= image.astype(np.int32)
-    # Convert rectangle coordinates to integers
-    rectangle = [int(coord) for coord in rectangle]
-        
-    # Create mask with ones
-    mask = np.ones(image.shape, dtype=bool)
-    
-    # Set rectangle area to False
-    mask[rectangle[1]:rectangle[3], rectangle[0]:rectangle[2]] = False
-
-    # Assign the value to the pixels outside the rectangle
-    np.putmask(image, mask, value)
-
-    return image
+    with open(destination_path, 'wb') as f:
+        for data in response.iter_content(1024):
+            f.write(data)
 def init_pose_model(config, checkpoint=None, device='cuda:0'):
     """Initialize a pose model from config file.
 
@@ -563,27 +801,6 @@ def init_pose_model(config, checkpoint=None, device='cuda:0'):
     model.to(device)
     model.eval()
     return model
-
-def get_first_frame(video_path):
-    # Open the video file
-    cap = cv2.VideoCapture(video_path)
-
-    # Check if video opened successfully
-    if not cap.isOpened():
-        print("Error opening video file")
-
-    # Read the first frame
-    ret, frame = cap.read()
-
-    if ret:
-        # Save the result
-        cv2.imwrite('first_frame.png', frame)
-    else:
-        print("Error getting frame")
-
-    # When everything done, release the video capture object
-    cap.release()
-
 #same as vis_pose_result but takes an np array and returns an np array
 def vis_pose_result_np(data_numpy, pose_results, thickness):
     
@@ -652,60 +869,6 @@ def vis_pose_result_np(data_numpy, pose_results, thickness):
     img_arr = np.array(Image.open(buf))
     
     return img_arr
-
-def images_to_video(image_arrays, output_file, fps):
-    # Get the shape of the images
-    h, w, _ = image_arrays[0].shape
-
-    # Define the codec and create a VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 'mp4v' is a codec suitable for mp4 files
-    out = cv2.VideoWriter(output_file, fourcc, fps, (w, h))
-
-    for image in image_arrays:
-        # Convert the image from RGB to BGR format
-        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        # Write the frame to the video file
-        out.write(image_bgr)
-
-    # Release the VideoWriter
-    out.release()
-
-def extract_frames(video_path, sample_rate):
-    # Open the video file
-    video = cv2.VideoCapture(video_path)
-
-    if not video.isOpened():
-        print("Could not open video")
-        return []
-
-    # Get the video's default frame rate
-    default_fps = video.get(cv2.CAP_PROP_FPS)
-    print(video_path + " has " + str(default_fps) + " fps")
-    if default_fps == None or default_fps == 0:
-        default_fps = 1
-    #if we specify a too high framerate just use the highest we can
-    if sample_rate > default_fps:
-        sample_rate = default_fps
-    frame_count = 0
-    frames = []
-
-    while True:
-        ret, frame = video.read()
-
-        # If the frame was not successfully read then break the loop
-        if not ret:
-            break
-
-        # If this frame number is divisible by the sample rate, store it
-        if frame_count % int(default_fps / sample_rate) == 0:
-            frames.append(np.array(frame))
-
-        frame_count += 1
-
-    video.release()
-
-    return frames
-
 def vis_bbox_result_np(data_numpy, bbox_results, thickness):
     
     h = data_numpy.shape[0]
@@ -742,4 +905,21 @@ def vis_bbox_result_np(data_numpy, bbox_results, thickness):
     img_arr = np.array(Image.open(buf))
     
     return img_arr
+def images_to_video(image_arrays, output_file, fps):
+    # Get the shape of the images
+    h, w, _ = image_arrays[0].shape
+
+    # Define the codec and create a VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 'mp4v' is a codec suitable for mp4 files
+    out = cv2.VideoWriter(output_file, fourcc, fps, (w, h))
+
+    for image in image_arrays:
+        # Convert the image from RGB to BGR format
+        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        # Write the frame to the video file
+        out.write(image_bgr)
+
+    # Release the VideoWriter
+    out.release()
+
 
