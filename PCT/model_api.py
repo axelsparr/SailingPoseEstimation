@@ -1,6 +1,6 @@
 from models import PCT
 
-from argparse import ArgumentParser
+from types import SimpleNamespace
 import os
 import warnings
 from ultralytics import YOLO
@@ -175,25 +175,22 @@ class PoseExtraction:
         video.release()
         return plt
     #rewrite of main in main_test_rvrt
-    def run_rvrt(task='001_RVRT_videosr_bi_REDS_30frames', sigma=0,
-         folder_lq='testsets/REDS4/sharp_bicubic', folder_gt=None,
+    def run_rvrt(self,
+        task='001_RVRT_videosr_bi_REDS_30frames', sigma=0,
+         folder_lq='temp/raw_frames',save_dir="temp/upscaled",
+         folder_gt=None,
          tile=[100,128,128], tile_overlap=[2,20,20],
          num_workers=16, save_result=False):
-
         # define model
         device = torch.device('cuda')
-        args = argparse.Namespace(task=task, sigma=sigma, folder_lq=folder_lq, folder_gt=folder_gt,
+        args = SimpleNamespace(task=task, sigma=sigma, folder_lq=folder_lq, folder_gt=folder_gt,
                                 tile=tile, tile_overlap=tile_overlap, num_workers=num_workers,
                                 save_result=save_result)
+        print("the task is: "+str(args.task))
         model = prepare_model_dataset(args)
         model.eval()
         model = model.to(device)
 
-        # define model
-        device = torch.device('cuda')
-        model = prepare_model_dataset(args)
-        model.eval()
-        model = model.to(device)
         if 'vimeo' in args.folder_lq.lower():
             test_set = VideoTestVimeo90KDataset({'dataroot_gt':args.folder_gt, 'dataroot_lq':args.folder_lq,
                                             'meta_info_file': "data/meta_info/meta_info_Vimeo90K_test_GT.txt",
@@ -207,7 +204,7 @@ class PoseExtraction:
 
         test_loader = DataLoader(dataset=test_set, num_workers=args.num_workers, batch_size=1, shuffle=False)
 
-        save_dir = f'results/{args.task}'
+        #save_dir = f'results/{args.task}'
         if args.save_result:
             os.makedirs(save_dir, exist_ok=True)
         test_results = OrderedDict()
@@ -661,7 +658,7 @@ class PoseExtraction:
         if not os.path.exists("./videos"):
             os.makedirs("./videos")
         self.parent_path=parent_path
-        self.image_folder = parent_path / Path("temp")
+        self.image_folder = parent_path / Path("temp") / Path("raw_frames") / Path("000")
 
         pose_config=Path("configs") / f"pct_{model_size}_classifier.py"
         pose_config=str(pose_config.absolute())
