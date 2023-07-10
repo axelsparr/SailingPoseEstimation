@@ -4,7 +4,7 @@ The following repository contains Axels work from my summer internship 2023. A d
 The code requires Python `3.8.x` and CUDA `11.1` to work. The superresolution i.e. RVRT doesnt run on Windows without major rewrites. Windows should work for everything else after possibly changing some of the paths in the code. Everything works on Linux.
 ## Important files
 The most important files are:
-- `PCT/clean.ipynb` contains example usage o fthe model api
+- `PCT/clean.ipynb` contains example usage of the model api
 - `PCT/model_api.py` the "backend" code
 
 ## Setup instructions
