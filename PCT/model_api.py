@@ -585,7 +585,7 @@ class PoseExtraction:
                 
         return img
     def create_video(self,human_poses):
-        img_files = glob.glob(os.path.join(Path("./temp"), '*.jpg')) #only take jpg files
+        img_files = glob.glob(os.path.join(Path("./temp/upscaled"), '*.jpg')) #only take jpg files
         img_files.sort()  # make sure that the images are in order
 
         # Read the first file to get the size and color information
@@ -600,13 +600,13 @@ class PoseExtraction:
         for i,img_file in enumerate(img_files):
             img = cv2.imread(img_file)
             if(human_poses[i] != []):
-                processed_img = cv2.resize(self.new_vis_pose_result_np(img,human_poses[i],1),(1920,1080))
+                processed_img = cv2.resize(self.new_vis_pose_result_np(img,human_poses[i],1),size)
                 out.write(processed_img)
                 prev_pose=human_poses[i]
             else:
                 #use prev frames skeleton
-                processed_img = cv2.resize(self.new_vis_pose_result_np(img,prev_pose,1),(1920,1080))
-                out.write(img)
+                processed_img = cv2.resize(self.new_vis_pose_result_np(img,prev_pose,1),size)
+                out.write(processed_img)
             prog_bar.update()
 
         out.release()
@@ -633,12 +633,14 @@ class PoseExtraction:
             human_bboxes_all.append(human_bboxes_batch)
             human_poses_batch=self.pct_pose_estimation(upscaled_batch,human_bboxes_batch)
             
+            #save the superres_batch
+            if not os.path.exists(str((Path("temp") / Path("upscaled")))):
+                    os.makedirs(str((Path("temp") / Path("upscaled"))))
+            self.write_cropped_images(upscaled_batch,start_frame)
             #append and set init_bbox for next iteration, and increment starting frame for next batch
             for item in human_poses_batch:
                 human_poses.append(item)
-            if not os.path.exists(str((Path("temp") / Path("upscaled")))):
-                    os.makedirs(str((Path("temp") / Path("upscaled"))))
-            self.write_cropped_images(cropped_batch,start_frame)
+
             init_bbox=sot_bbox_batch[-1]["bbox"][:4] #[]"bbox"] because its a map, [:4] to ditch the probability
             start_frame+=len(batch)
         #p.delete_frames_data_dir()
